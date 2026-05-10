@@ -1201,5 +1201,34 @@ func TestHandleAPIError_JSON(t *testing.T) {
 	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
 }
 
+func TestHandleGetInstallation_IncludesConfig(t *testing.T) {
+	// The iOS client reads json["config"] in getInstallationDetails to pre-populate the
+	// Pixlet config form when editing — make sure the saved config round-trips through GET.
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+	deviceID := "testdevice"
+	installID := "configapp"
+
+	cfg := data.JSONMap{"timezone": "UTC", "color": "#ff0000", "count": float64(3)}
+	require.NoError(t, gorm.G[data.App](s.DB).Create(context.Background(), &data.App{
+		DeviceID: deviceID,
+		Iname:    installID,
+		Name:     "ConfigApp",
+		Enabled:  true,
+		Config:   cfg,
+	}))
+
+	req := newAPIRequest("GET", fmt.Sprintf("/v0/devices/%s/installations/%s", deviceID, installID), apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var payload AppPayload
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&payload))
+	assert.Equal(t, "UTC", payload.Config["timezone"])
+	assert.Equal(t, "#ff0000", payload.Config["color"])
+	assert.Equal(t, float64(3), payload.Config["count"])
+}
+
 // Suppress unused-import warning when only constants from apps are referenced indirectly.
 var _ = apps.AppMetadata{}

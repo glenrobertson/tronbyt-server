@@ -206,6 +206,10 @@ type AppPayload struct {
 	RecurrencePattern   map[string]any      `json:"recurrencePattern"`
 	RecurrenceStartDate *string             `json:"recurrenceStartDate"`
 	RecurrenceEndDate   *string             `json:"recurrenceEndDate"`
+
+	// Config is the saved Pixlet config for this installation. The iOS client reads it to
+	// pre-populate the schema form when editing.
+	Config map[string]any `json:"config"`
 }
 
 func (s *Server) toAppPayload(device *data.Device, app *data.App) AppPayload {
@@ -231,6 +235,8 @@ func (s *Server) toAppPayload(device *data.Device, app *data.App) AppPayload {
 		RecurrencePattern:   app.RecurrencePattern,
 		RecurrenceStartDate: app.RecurrenceStartDate,
 		RecurrenceEndDate:   app.RecurrenceEndDate,
+
+		Config: app.Config,
 	}
 }
 
