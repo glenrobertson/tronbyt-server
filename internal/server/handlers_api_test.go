@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"tronbyt-server/internal/apps"
 	"tronbyt-server/internal/config"
 	"tronbyt-server/internal/data"
 
@@ -959,3 +960,246 @@ func TestHandleRebootDeviceAPI(t *testing.T) {
 		t.Errorf("Expected body 'Reboot command sent.', got '%s'", rr.Body.String())
 	}
 }
+
+// seedSystemApp installs a star-based system app on disk and refreshes the cache.
+func seedSystemApp(t *testing.T, s *Server, appID string) {
+	t.Helper()
+	appDir := filepath.Join(s.DataDir, "system-apps", "apps", appID)
+	require.NoError(t, os.MkdirAll(appDir, 0755))
+	starContent := `
+load("render.star", "render")
+def main(config):
+    return render.Root(child=render.Box(width=64, height=32, color="#00ff00"))
+`
+	require.NoError(t, os.WriteFile(filepath.Join(appDir, appID+".star"), []byte(starContent), 0644))
+	s.RefreshSystemAppsCache()
+}
+
+func TestHandleListAppsAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	seedSystemApp(t, s, "clock")
+
+	req := newAPIRequest("GET", "/v0/apps", apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp AppCatalogResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	require.Len(t, resp.SystemApps, 1)
+	assert.Equal(t, "clock", resp.SystemApps[0].ID)
+	assert.False(t, resp.SystemApps[0].Installed)
+	assert.Empty(t, resp.CustomApps)
+}
+
+func TestHandleListDeviceAppsAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+	deviceID := "testdevice"
+
+	seedSystemApp(t, s, "clock")
+
+	// Install clock on the device.
+	clockPath := "system-apps/apps/clock"
+	require.NoError(t, gorm.G[data.App](s.DB).Create(context.Background(), &data.App{
+		DeviceID: deviceID,
+		Iname:    "100",
+		Name:     "clock",
+		Path:     &clockPath,
+		Enabled:  true,
+	}))
+
+	req := newAPIRequest("GET", fmt.Sprintf("/v0/devices/%s/apps", deviceID), apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp AppCatalogResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	require.Len(t, resp.SystemApps, 1)
+	assert.True(t, resp.SystemApps[0].Installed, "expected installed=true after seeding the app on the device")
+}
+
+func TestHandleGetAppSchemaAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	seedSystemApp(t, s, "clock")
+
+	req := newAPIRequest("GET", "/v0/apps/clock/schema", apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+
+	var resp struct {
+		Schema json.RawMessage `json:"schema"`
+	}
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	assert.NotEmpty(t, resp.Schema, "schema field should be present")
+}
+
+func TestHandleGetAppSchemaAPI_NotFound(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	req := newAPIRequest("GET", "/v0/apps/missing/schema", apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+
+	// Errors must be JSON-shaped.
+	var errResp map[string]string
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&errResp))
+	assert.NotEmpty(t, errResp["error"])
+}
+
+func TestHandleSchemaHandlerAppAPI_AppNotFound(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	// Verifies the route is registered + auth gate works + JSON-shaped error response.
+	// Driving Pixlet's CallSchemaHandler from a test is awkward because handlers must be
+	// declared in the app's schema; the iOS-client contract we care about here is the JSON
+	// envelope on errors.
+	body, _ := json.Marshal(map[string]string{"param": "hello"})
+	req := newAPIRequest("POST", "/v0/apps/no-such-app/schema_handler/get_options", apiKey, body)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	var errResp map[string]string
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&errResp))
+	assert.NotEmpty(t, errResp["error"])
+}
+
+func TestHandleCreateDeviceAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	body, _ := json.Marshal(CreateDevicePayload{
+		Name:            "iOS New",
+		Type:            "tidbyt_gen1",
+		Brightness:      new(50),
+		DefaultInterval: new(10),
+	})
+	req := newAPIRequest("POST", "/v0/devices", apiKey, body)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+
+	var resp DevicePayload
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	assert.NotEmpty(t, resp.ID)
+	assert.Equal(t, "iOS New", resp.DisplayName)
+	assert.Equal(t, 50, resp.Brightness)
+	assert.Equal(t, 10, resp.IntervalSec)
+
+	// DB row should exist.
+	saved, err := gorm.G[data.Device](s.DB).Where("id = ?", resp.ID).First(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "testuser", saved.Username)
+}
+
+func TestHandleCreateDeviceAPI_DuplicateName(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	body, _ := json.Marshal(CreateDevicePayload{Name: "Test Device", Type: "tidbyt_gen1"})
+	req := newAPIRequest("POST", "/v0/devices", apiKey, body)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusConflict, rr.Code)
+}
+
+func TestHandleCreateInstallationAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+	deviceID := "testdevice"
+
+	seedSystemApp(t, s, "clock")
+
+	body, _ := json.Marshal(CreateInstallationPayload{
+		AppName:     "clock",
+		Enabled:     new(true),
+		UInterval:   new(45),
+		DisplayTime: new(7),
+		Notes:       "test install",
+		Config:      map[string]any{"timezone": "UTC"},
+	})
+	req := newAPIRequest("POST", fmt.Sprintf("/v0/devices/%s/installations", deviceID), apiKey, body)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+
+	var resp AppPayload
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	assert.Equal(t, "clock", resp.AppID)
+	assert.Equal(t, 45, resp.RenderIntervalMin)
+	assert.Equal(t, 7, resp.DisplayTimeSec)
+
+	// DB row should exist with the app path.
+	saved, err := gorm.G[data.App](s.DB).Where("device_id = ? AND iname = ?", deviceID, resp.ID).First(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, saved.Path)
+	assert.Equal(t, "system-apps/apps/clock", *saved.Path)
+}
+
+func TestHandleCreateInstallationAPI_AppNotFound(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	body, _ := json.Marshal(CreateInstallationPayload{AppName: "nonexistent"})
+	req := newAPIRequest("POST", "/v0/devices/testdevice/installations", apiKey, body)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+
+	var errResp map[string]string
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&errResp))
+	assert.NotEmpty(t, errResp["error"])
+}
+
+func TestHandleDeleteDeviceAPI(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+	deviceID := "testdevice"
+
+	// Add an installation that should be cascade-deleted.
+	require.NoError(t, gorm.G[data.App](s.DB).Create(context.Background(), &data.App{
+		DeviceID: deviceID,
+		Iname:    "100",
+		Name:     "x",
+		Enabled:  true,
+	}))
+
+	req := newAPIRequest("DELETE", fmt.Sprintf("/v0/devices/%s", deviceID), apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	// Device gone.
+	_, err := gorm.G[data.Device](s.DB).Where("id = ?", deviceID).First(context.Background())
+	assert.Error(t, err)
+
+	// Installations gone.
+	count, err := gorm.G[data.App](s.DB).Where("device_id = ?", deviceID).Count(context.Background(), "*")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), count)
+}
+
+func TestHandleAPIError_JSON(t *testing.T) {
+	s := newTestServerAPI(t)
+	apiKey := "test_api_key"
+
+	// Missing app should return JSON-shaped error, not text.
+	req := newAPIRequest("GET", "/v0/apps/does-not-exist/schema", apiKey, nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+}
+
+// Suppress unused-import warning when only constants from apps are referenced indirectly.
+var _ = apps.AppMetadata{}

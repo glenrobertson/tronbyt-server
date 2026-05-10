@@ -14,9 +14,11 @@ import (
 
 	"tronbyt-server/internal/apps"
 	"tronbyt-server/internal/data"
+	"tronbyt-server/internal/renderer"
 
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // --- API Handlers ---
@@ -994,17 +996,580 @@ func (s *Server) handleUpdateFirmwareSettingsAPI(w http.ResponseWriter, r *http.
 	}
 }
 
+// writeAPIError writes a JSON error response: {"error": "..."} with the given status code.
+// /v0 endpoints added for the iOS client must always return JSON; the iOS client crashes on
+// non-JSON responses.
+func writeAPIError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+		slog.Error("Failed to encode API error", "error", err)
+	}
+}
+
+// writeAPIJSON writes value as JSON with the given status code.
+func writeAPIJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		slog.Error("Failed to encode API JSON", "error", err)
+	}
+}
+
+// AppCatalogEntry represents an entry in the apps catalog returned by the iOS client.
+// JSON keys are snake_case to match the existing iOS Codable expectations.
+type AppCatalogEntry struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+	Installed   bool   `json:"installed"`
+}
+
+// AppCatalogResponse is the response shape for /v0/apps and /v0/devices/{id}/apps.
+type AppCatalogResponse struct {
+	SystemApps []AppCatalogEntry `json:"system_apps"`
+	CustomApps []AppCatalogEntry `json:"custom_apps"`
+}
+
+func toCatalogEntry(meta apps.AppMetadata) AppCatalogEntry {
+	desc := meta.Summary
+	if desc == "" {
+		desc = meta.Desc
+	}
+	return AppCatalogEntry{
+		ID:          meta.ID,
+		Name:        meta.Name,
+		Description: desc,
+		Path:        meta.Path,
+		Installed:   meta.IsInstalled,
+	}
+}
+
+// buildAppCatalog returns system + custom app catalogs for the given user. If device is
+// non-nil the Installed flag is populated against that device's installations.
+func (s *Server) buildAppCatalog(user *data.User, device *data.Device) AppCatalogResponse {
+	systemApps := s.ListSystemApps()
+	customApps := apps.ListUserApps(s.DataDir, user.Username)
+	if device != nil {
+		s.markInstalledApps(device, systemApps, customApps)
+	}
+
+	resp := AppCatalogResponse{
+		SystemApps: make([]AppCatalogEntry, 0, len(systemApps)),
+		CustomApps: make([]AppCatalogEntry, 0, len(customApps)),
+	}
+	for _, m := range systemApps {
+		resp.SystemApps = append(resp.SystemApps, toCatalogEntry(m))
+	}
+	for _, m := range customApps {
+		resp.CustomApps = append(resp.CustomApps, toCatalogEntry(m))
+	}
+	return resp
+}
+
+// findAppByID looks up an app by its catalog ID across system apps and the user's custom apps.
+// Returns nil if not found.
+func (s *Server) findAppByID(user *data.User, appID string) *apps.AppMetadata {
+	for _, m := range s.ListSystemApps() {
+		if m.ID == appID {
+			meta := m
+			return &meta
+		}
+	}
+	for _, m := range apps.ListUserApps(s.DataDir, user.Username) {
+		if m.ID == appID {
+			meta := m
+			return &meta
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleListAppsAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	writeAPIJSON(w, http.StatusOK, s.buildAppCatalog(user, nil))
+}
+
+func (s *Server) handleListDeviceAppsAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	device := GetDevice(r)
+	writeAPIJSON(w, http.StatusOK, s.buildAppCatalog(user, device))
+}
+
+func (s *Server) handleGetAppSchemaAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	appID := r.PathValue("appId")
+
+	meta := s.findAppByID(user, appID)
+	if meta == nil {
+		writeAPIError(w, http.StatusNotFound, "App not found")
+		return
+	}
+
+	appPath, err := securejoin.SecureJoin(s.DataDir, meta.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid app path")
+		return
+	}
+
+	var schemaBytes []byte
+	if !strings.HasSuffix(strings.ToLower(appPath), ".webp") {
+		schemaBytes, err = renderer.GetSchema(r.Context(), appPath, 64, 32, false)
+		if err != nil {
+			slog.Error("Failed to get app schema", "appID", appID, "error", err)
+			writeAPIError(w, http.StatusInternalServerError, "Failed to get schema")
+			return
+		}
+	}
+	if len(schemaBytes) == 0 {
+		schemaBytes = []byte("{}")
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write([]byte(`{"schema":`)); err != nil {
+		slog.Error("Failed to write schema response", "error", err)
+		return
+	}
+	if _, err := w.Write(schemaBytes); err != nil {
+		slog.Error("Failed to write schema body", "error", err)
+		return
+	}
+	if _, err := w.Write([]byte(`}`)); err != nil {
+		slog.Error("Failed to write schema response", "error", err)
+	}
+}
+
+type schemaHandlerRequest struct {
+	Param  string         `json:"param"`
+	Config map[string]any `json:"config"`
+}
+
+// runSchemaHandler executes a Pixlet schema handler at appPath and writes the JSON result.
+func (s *Server) runSchemaHandler(w http.ResponseWriter, r *http.Request, appPath string, supports2x bool, config map[string]any) {
+	handler := r.PathValue("handler")
+
+	var payload schemaHandlerRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if payload.Config != nil {
+		config = payload.Config
+	}
+
+	// Pixlet's CallSchemaHandler can panic on apps that don't declare the requested handler in
+	// their schema. Recover locally so the iOS client always sees a JSON envelope.
+	var (
+		result string
+		err    error
+	)
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("Schema handler panicked", "handler", handler, "panic", rec)
+				err = fmt.Errorf("handler panicked: %v", rec)
+			}
+		}()
+		result, err = renderer.CallSchemaHandler(
+			r.Context(),
+			appPath,
+			config,
+			64, 32,
+			supports2x,
+			handler,
+			payload.Param,
+		)
+	}()
+	if err != nil {
+		slog.Error("Schema handler failed", "handler", handler, "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Schema handler failed")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write([]byte(result)); err != nil {
+		slog.Error("Failed to write schema handler response", "error", err)
+	}
+}
+
+func (s *Server) handleSchemaHandlerAppAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	appID := r.PathValue("appId")
+
+	meta := s.findAppByID(user, appID)
+	if meta == nil {
+		writeAPIError(w, http.StatusNotFound, "App not found")
+		return
+	}
+	appPath, err := securejoin.SecureJoin(s.DataDir, meta.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid app path")
+		return
+	}
+	s.runSchemaHandler(w, r, appPath, false, nil)
+}
+
+func (s *Server) handleSchemaHandlerInstallationAPI(w http.ResponseWriter, r *http.Request) {
+	device := GetDevice(r)
+	iname := r.PathValue("iname")
+	app := device.GetApp(iname)
+	if app == nil {
+		writeAPIError(w, http.StatusNotFound, "Installation not found")
+		return
+	}
+	if app.Path == nil || *app.Path == "" {
+		writeAPIError(w, http.StatusBadRequest, "App path not set")
+		return
+	}
+	appPath, err := securejoin.SecureJoin(s.DataDir, *app.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid app path")
+		return
+	}
+	s.runSchemaHandler(w, r, appPath, device.Type.Supports2x(), app.Config)
+}
+
+// renderAndWriteWebP renders the given app at appPath with the provided config and writes
+// image/webp to w.
+func (s *Server) renderAndWriteWebP(w http.ResponseWriter, r *http.Request, device *data.Device, app *data.App, appPath string, config map[string]any) {
+	imgBytes, _, err := s.RenderApp(r.Context(), device, app, appPath, config)
+	if err != nil {
+		slog.Error("Preview render failed", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Render failed")
+		return
+	}
+	w.Header().Set("Content-Type", "image/webp")
+	w.Header().Set("Cache-Control", "no-cache")
+	if _, err := w.Write(imgBytes); err != nil {
+		slog.Error("Failed to write preview image bytes", "error", err)
+	}
+}
+
+func parsePreviewConfig(r *http.Request) (map[string]any, bool, error) {
+	configParam := r.URL.Query().Get("config")
+	if configParam == "" {
+		return nil, false, nil
+	}
+	var configData map[string]any
+	if err := json.Unmarshal([]byte(configParam), &configData); err != nil {
+		return nil, false, err
+	}
+	return configData, true, nil
+}
+
+func (s *Server) handlePreviewInstallationAPI(w http.ResponseWriter, r *http.Request) {
+	device := GetDevice(r)
+	iname := r.PathValue("iname")
+	app := device.GetApp(iname)
+	if app == nil {
+		writeAPIError(w, http.StatusNotFound, "Installation not found")
+		return
+	}
+
+	override, hasOverride, err := parsePreviewConfig(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid config JSON")
+		return
+	}
+
+	// Pushed apps: serve the saved image (no override possible).
+	if app.Pushed && app.Path != nil && strings.HasPrefix(*app.Path, "pushed:") {
+		installationID := strings.TrimPrefix(*app.Path, "pushed:")
+		webpDir, err := s.ensureDeviceImageDir(device.ID)
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "Internal Server Error")
+			return
+		}
+		path, err := securejoin.SecureJoin(filepath.Join(webpDir, "pushed"), installationID+".webp")
+		if err == nil {
+			if _, err := os.Stat(path); err == nil {
+				http.ServeFile(w, r, path)
+				return
+			}
+		}
+		writeAPIError(w, http.StatusNotFound, "Image not found")
+		return
+	}
+
+	if app.Path == nil || *app.Path == "" {
+		writeAPIError(w, http.StatusBadRequest, "App path not set")
+		return
+	}
+	appPath, err := securejoin.SecureJoin(s.DataDir, *app.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid app path")
+		return
+	}
+
+	config := app.Config
+	if hasOverride {
+		config = override
+	}
+	s.renderAndWriteWebP(w, r, device, app, appPath, config)
+}
+
+func (s *Server) handlePreviewAppAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	device := GetDevice(r)
+	appID := r.PathValue("appId")
+
+	meta := s.findAppByID(user, appID)
+	if meta == nil {
+		writeAPIError(w, http.StatusNotFound, "App not found")
+		return
+	}
+	appPath, err := securejoin.SecureJoin(s.DataDir, meta.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid app path")
+		return
+	}
+
+	override, _, err := parsePreviewConfig(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid config JSON")
+		return
+	}
+	s.renderAndWriteWebP(w, r, device, nil, appPath, override)
+}
+
+// CreateDevicePayload represents the JSON body for POST /v0/devices.
+type CreateDevicePayload struct {
+	Name            string `json:"name"`
+	Type            string `json:"type"`
+	Brightness      *int   `json:"brightness"`
+	DefaultInterval *int   `json:"default_interval"`
+	Notes           string `json:"notes"`
+}
+
+func (s *Server) handleCreateDeviceAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+
+	var payload CreateDevicePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if payload.Name == "" {
+		writeAPIError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	for _, d := range user.Devices {
+		if d.Name == payload.Name {
+			writeAPIError(w, http.StatusConflict, "name already exists")
+			return
+		}
+	}
+
+	deviceType := data.DeviceOther
+	if payload.Type != "" {
+		if t, ok := data.StringToDeviceType[payload.Type]; ok {
+			deviceType = t
+		} else {
+			writeAPIError(w, http.StatusBadRequest, "invalid type")
+			return
+		}
+	}
+
+	deviceID, err := generateSecureToken(8)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "Failed to generate device ID")
+		return
+	}
+	apiKey, err := generateSecureToken(32)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "Failed to generate API key")
+		return
+	}
+
+	brightness := data.Brightness(20)
+	if payload.Brightness != nil {
+		brightness = data.Brightness(*payload.Brightness)
+	}
+	defaultInterval := 15
+	if payload.DefaultInterval != nil {
+		defaultInterval = *payload.DefaultInterval
+	}
+	defaultColorFilter := data.ColorFilterNone
+
+	newDevice := data.Device{
+		ID:              deviceID,
+		Username:        user.Username,
+		Name:            payload.Name,
+		Type:            deviceType,
+		APIKey:          apiKey,
+		RequireAPIKey:   true,
+		Notes:           payload.Notes,
+		Brightness:      brightness,
+		DefaultInterval: defaultInterval,
+		ColorFilter:     &defaultColorFilter,
+	}
+	newDevice.ImgURL = s.getImageURLWithKey(r, newDevice.ID, apiKey)
+	newDevice.WsURL = s.getWebsocketURLWithKey(r, newDevice.ID, apiKey)
+
+	if err := gorm.G[data.Device](s.DB).Create(r.Context(), &newDevice); err != nil {
+		slog.Error("Failed to create device via API", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Failed to save device")
+		return
+	}
+	if _, err := s.ensureDeviceImageDir(newDevice.ID); err != nil {
+		slog.Error("Failed to create device webp dir", "device_id", newDevice.ID, "error", err)
+	}
+
+	writeAPIJSON(w, http.StatusCreated, s.toDevicePayload(&newDevice))
+}
+
+// CreateInstallationPayload represents the JSON body for POST /v0/devices/{id}/installations.
+// The iOS client sends snake_case keys (uinterval, display_time, app_name) so accept those.
+type CreateInstallationPayload struct {
+	AppName     string         `json:"app_name"`
+	Enabled     *bool          `json:"enabled"`
+	UInterval   *int           `json:"uinterval"`
+	DisplayTime *int           `json:"display_time"`
+	Notes       string         `json:"notes"`
+	Config      map[string]any `json:"config"`
+}
+
+func (s *Server) handleCreateInstallationAPI(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	device := GetDevice(r)
+
+	var payload CreateInstallationPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if payload.AppName == "" {
+		writeAPIError(w, http.StatusBadRequest, "app_name is required")
+		return
+	}
+
+	meta := s.findAppByID(user, payload.AppName)
+	if meta == nil {
+		writeAPIError(w, http.StatusNotFound, "App not found")
+		return
+	}
+
+	iname, err := generateUniqueIname(s.DB, device.ID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "Failed to generate installation ID")
+		return
+	}
+
+	uinterval := 10
+	if payload.UInterval != nil && *payload.UInterval > 0 {
+		uinterval = *payload.UInterval
+	} else if meta.RecommendedInterval > 0 {
+		uinterval = meta.RecommendedInterval
+	}
+	displayTime := 0
+	if payload.DisplayTime != nil {
+		displayTime = *payload.DisplayTime
+	}
+	enabled := true
+	if payload.Enabled != nil {
+		enabled = *payload.Enabled
+	}
+
+	pathCopy := meta.Path
+	newApp := data.App{
+		DeviceID:    device.ID,
+		Iname:       iname,
+		Name:        meta.ID,
+		UInterval:   uinterval,
+		DisplayTime: displayTime,
+		Notes:       payload.Notes,
+		Enabled:     enabled,
+		Path:        &pathCopy,
+		Config:      data.JSONMap(payload.Config),
+	}
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if user.AddAppsToTop {
+			if _, err := gorm.G[data.App](tx).
+				Where("device_id = ?", device.ID).
+				Update(r.Context(), "order", gorm.Expr("? + 1", clause.Column{Name: "order"})); err != nil {
+				return err
+			}
+			newApp.Order = 0
+		} else {
+			maxOrder, err := getMaxAppOrder(tx, device.ID)
+			if err != nil {
+				return err
+			}
+			newApp.Order = maxOrder + 1
+		}
+		return gorm.G[data.App](tx).Create(r.Context(), &newApp)
+	})
+	if err != nil {
+		slog.Error("Failed to create installation via API", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Failed to save installation")
+		return
+	}
+
+	// Trigger initial render (mirrors handleAddAppPost).
+	s.possiblyRender(r.Context(), &newApp, device, user)
+
+	s.notifyDashboard(user.Username, WSEvent{Type: "apps_changed", DeviceID: device.ID})
+
+	writeAPIJSON(w, http.StatusCreated, s.toAppPayload(device, &newApp))
+}
+
+func (s *Server) handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
+	device := GetDevice(r)
+	user := GetUser(r)
+
+	deviceWebpDir, err := s.ensureDeviceImageDir(device.ID)
+	if err != nil {
+		slog.Error("Failed to get device webp directory for deletion", "device_id", device.ID, "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+	if err := os.RemoveAll(deviceWebpDir); err != nil {
+		slog.Error("Failed to remove device webp directory", "device_id", device.ID, "error", err)
+	}
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := gorm.G[data.App](tx).Where("device_id = ?", device.ID).Delete(r.Context()); err != nil {
+			return err
+		}
+		if _, err := gorm.G[data.Device](tx).Where("id = ?", device.ID).Delete(r.Context()); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Error("Failed to delete device via API", "device_id", device.ID, "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "Failed to delete device")
+		return
+	}
+
+	s.notifyDashboard(user.Username, WSEvent{Type: "device_deleted", DeviceID: device.ID})
+
+	writeAPIJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) SetupAPIRoutes() {
 	// API v0 Group - authenticated with Middleware
 	s.Router.Handle("GET /v0/devices", s.APIAuthMiddleware(http.HandlerFunc(s.handleListDevices)))
+	s.Router.Handle("POST /v0/devices", s.APIAuthMiddleware(http.HandlerFunc(s.handleCreateDeviceAPI)))
 	s.Router.Handle("GET /v0/devices/{id}", s.APIAuthMiddleware(s.RequireDevice(s.handleGetDevice)))
+	s.Router.Handle("DELETE /v0/devices/{id}", s.APIAuthMiddleware(s.RequireDevice(s.handleDeleteDeviceAPI)))
 	s.Router.Handle("POST /v0/devices/{id}/push", s.APIAuthMiddleware(s.RequireDevice(s.handlePushImage)))
 	s.Router.Handle("POST /v0/devices/{id}/push_app", s.APIAuthMiddleware(s.RequireDevice(s.handlePushApp)))
 	s.Router.Handle("POST /v0/devices/{id}/update_firmware_settings", s.APIAuthMiddleware(s.RequireDevice(s.handleUpdateFirmwareSettingsAPI)))
 	s.Router.Handle("POST /v0/devices/{id}/reboot", s.APIAuthMiddleware(s.RequireDevice(s.handleRebootDeviceAPI)))
 	s.Router.Handle("GET /v0/devices/{id}/installations", s.APIAuthMiddleware(s.RequireDevice(s.handleListInstallations)))
+	s.Router.Handle("POST /v0/devices/{id}/installations", s.APIAuthMiddleware(s.RequireDevice(s.handleCreateInstallationAPI)))
 	s.Router.Handle("GET /v0/devices/{id}/installations/{iname}", s.APIAuthMiddleware(s.RequireDevice(s.handleGetInstallation)))
 	s.Router.Handle("PATCH /v0/devices/{id}", s.APIAuthMiddleware(s.RequireDevice(s.handlePatchDevice)))
 	s.Router.Handle("PATCH /v0/devices/{id}/installations/{iname}", s.APIAuthMiddleware(s.RequireDevice(s.handlePatchInstallation)))
 	s.Router.Handle("DELETE /v0/devices/{id}/installations/{iname}", s.APIAuthMiddleware(s.RequireDevice(s.handleDeleteInstallationAPI)))
+	s.Router.Handle("GET /v0/devices/{id}/installations/{iname}/preview", s.APIAuthMiddleware(s.RequireDevice(s.handlePreviewInstallationAPI)))
+	s.Router.Handle("POST /v0/devices/{id}/installations/{iname}/schema_handler/{handler}", s.APIAuthMiddleware(s.RequireDevice(s.handleSchemaHandlerInstallationAPI)))
+	s.Router.Handle("GET /v0/devices/{id}/apps", s.APIAuthMiddleware(s.RequireDevice(s.handleListDeviceAppsAPI)))
+	s.Router.Handle("GET /v0/devices/{id}/apps/{appId}/preview", s.APIAuthMiddleware(s.RequireDevice(s.handlePreviewAppAPI)))
+	s.Router.Handle("GET /v0/apps", s.APIAuthMiddleware(http.HandlerFunc(s.handleListAppsAPI)))
+	s.Router.Handle("GET /v0/apps/{appId}/schema", s.APIAuthMiddleware(http.HandlerFunc(s.handleGetAppSchemaAPI)))
+	s.Router.Handle("POST /v0/apps/{appId}/schema_handler/{handler}", s.APIAuthMiddleware(http.HandlerFunc(s.handleSchemaHandlerAppAPI)))
 }
